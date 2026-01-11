@@ -1,0 +1,9 @@
+/docs/
+/lib/
+/bin/
+/.shards/
+*.dwarf
+/facet
+/facet_server
+/resp_parser
+/resp_serializer

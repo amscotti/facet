@@ -1,0 +1,87 @@
+Lint/DebugCalls:
+  Enabled: true
+
+Lint/EmptyEnsure:
+  Enabled: true
+
+Lint/EmptyExpression:
+  Enabled: true
+
+Lint/EmptyString:
+  Enabled: true
+
+Lint/HashComparison:
+  Enabled: true
+
+Lint/LiteralAssignmentsInExpressions:
+  Enabled: true
+
+Lint/NotNil:
+  Enabled: true
+
+Lint/RedundantControlExpression:
+  Enabled: true
+
+Lint/RedundantStringCoercion:
+  Enabled: true
+
+Lint/ShadowingOuterLocalVar:
+  Enabled: true
+
+Lint/SharedVarInFiber:
+  Enabled: true
+
+Lint/StructFields:
+  Enabled: true
+
+Lint/UselessAssign:
+  Enabled: true
+
+Lint/ComparisonToBoolean:
+  Enabled: true
+
+Performance/AnyAfterIsA:
+  Enabled: true
+
+Performance/ChainedCallWithNoBang:
+  Enabled: true
+
+Performance/CompactString:
+  Enabled: true
+
+Performance/ContextNotNeeded:
+  Enabled: true
+
+Performance/SizeAfterIsA:
+  Enabled: true
+
+Performance/SlowHashSetNew:
+  Enabled: true
+
+Performance/StringReallocation:
+  Enabled: true
+
+Style/Command:
+  Enabled: true
+  Exclude:
+    - spec/**/*
+
+Style/Documentation:
+  Enabled: false
+
+Style/LargeNumbers:
+  Enabled: true
+  IntMinDigits: 5
+
+Style/MethodNames:
+  Enabled: true
+
+Style/WhileTrue:
+  Enabled: true
+
+Style/YodaCondition:
+  Enabled: true
+
+Metrics/CyclomaticComplexity:
+  Enabled: true
+  MaxComplexity: 20

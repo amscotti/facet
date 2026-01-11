@@ -1,0 +1,38 @@
+# Git
+.git
+.gitignore
+
+# Build artifacts
+bin/
+lib/
+facet
+facet_server
+*.dwarf
+
+# Development files
+spec/
+.github/
+.ameba.yml
+.editorconfig
+.spectator
+
+# Documentation
+*.md
+!README.md
+LICENSE
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test files
+test_*.ts
+benchmark.sh
+worker_experiment.sh
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose.yml
