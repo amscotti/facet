@@ -219,7 +219,7 @@ Spectator.describe Redis::SortedSetType do
     it "supports reverse" do
       result = zset.zrange(0, 1, reverse: true)
       # Returns elements from the end of the sorted set
-      expect(result).to eq([b("b"), b("c")])
+      expect(result).to eq([b("c"), b("b")])
     end
   end
 

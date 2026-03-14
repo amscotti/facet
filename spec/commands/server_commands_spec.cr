@@ -55,6 +55,33 @@ Spectator.describe "Server Commands" do
       handler.execute(cmd("DBSIZE"), conn)
       expect(conn.last_response).to eq(2_i64)
     end
+
+    it "does not count expired keys" do
+      db.set(b("expired"), b("value"), Time.utc.to_unix_ms - 1)
+      db.set(b("active"), b("value"))
+
+      handler.execute(cmd("DBSIZE"), conn)
+      expect(conn.last_response).to eq(1_i64)
+    end
+  end
+
+  describe "CONFIG" do
+    it "returns supported config values" do
+      handler.execute(cmd("CONFIG", "GET", "appendonly"), conn)
+      expect(conn.last_response).to eq([b("appendonly"), b("no")] of Redis::RespValue)
+    end
+
+    it "supports glob patterns" do
+      handler.execute(cmd("CONFIG", "GET", "a*"), conn)
+      result = conn.last_response.as(Array)
+      expect(result).to contain(b("appendonly"))
+      expect(result).to contain(b("no"))
+    end
+
+    it "returns an empty array for unknown config keys" do
+      handler.execute(cmd("CONFIG", "GET", "nomatch"), conn)
+      expect(conn.last_response).to eq([] of Redis::RespValue)
+    end
   end
 
   describe "FLUSHDB" do
@@ -81,11 +108,35 @@ Spectator.describe "Server Commands" do
       expect(result.as(Array).size).to eq(3)
     end
 
+    it "does not include expired keys" do
+      db.set(b("expired"), b("value"), Time.utc.to_unix_ms - 1)
+
+      handler.execute(cmd("KEYS", "*"), conn)
+      result = conn.last_response.as(Array)
+      expect(result).not_to contain(b("expired"))
+    end
+
     it "filters keys with pattern" do
       handler.execute(cmd("KEYS", "key*"), conn)
       result = conn.last_response
       expect(result).to be_a(Array(Redis::RespValue))
       expect(result.as(Array).size).to eq(2)
+    end
+
+    it "supports character classes and escaped specials" do
+      db.set(b("hello"), b("1"))
+      db.set(b("hallo"), b("1"))
+      db.set(b("h?llo"), b("1"))
+
+      handler.execute(cmd("KEYS", "h[ae]llo"), conn)
+      result = conn.last_response.as(Array)
+      expect(result).to contain(b("hello"))
+      expect(result).to contain(b("hallo"))
+      expect(result).not_to contain(b("h?llo"))
+
+      handler.execute(cmd("KEYS", "h\\?llo"), conn)
+      escaped = conn.last_response.as(Array)
+      expect(escaped).to eq([b("h?llo")] of Redis::RespValue)
     end
 
     it "returns empty array when no matches" do

@@ -4,6 +4,7 @@ require "../server/connection"
 module Redis
   struct SetOptions
     property ttl : Int64?
+    property? ttl_specified : Bool
     property? nx : Bool
     property? xx : Bool
     property? get_flag : Bool
@@ -12,6 +13,7 @@ module Redis
 
     def initialize
       @ttl = nil
+      @ttl_specified = false
       @nx = false
       @xx = false
       @get_flag = false
@@ -254,6 +256,7 @@ module Redis
 
     private def dispatch_server_commands(cmd : String, args : Array(RespValue), client : Connection) : Bool
       case cmd
+      when "CONFIG"  then handle_config(args, client)
       when "DBSIZE"  then handle_dbsize(args, client)
       when "FLUSHDB" then handle_flushdb(args, client)
       when "KEYS"    then handle_keys(args, client)
@@ -397,6 +400,11 @@ module Redis
         return
       end
 
+      if opts.keepttl? && opts.ttl_specified?
+        client.send_error("syntax error")
+        return
+      end
+
       old_value = current_db(client).get(key) if opts.get_flag?
       exists = current_db(client).exists?(key)
 
@@ -433,21 +441,25 @@ module Redis
           result = parse_ttl_option(args, idx, :seconds)
           return set_error(opts, result[:error]) if result[:error]
           opts.ttl = result[:ttl]
+          opts.ttl_specified = true
           idx = result[:next_idx]
         when "PX"
           result = parse_ttl_option(args, idx, :milliseconds)
           return set_error(opts, result[:error]) if result[:error]
           opts.ttl = result[:ttl]
+          opts.ttl_specified = true
           idx = result[:next_idx]
         when "EXAT"
           result = parse_ttl_option(args, idx, :unix_seconds)
           return set_error(opts, result[:error]) if result[:error]
           opts.ttl = result[:ttl]
+          opts.ttl_specified = true
           idx = result[:next_idx]
         when "PXAT"
           result = parse_ttl_option(args, idx, :unix_milliseconds)
           return set_error(opts, result[:error]) if result[:error]
           opts.ttl = result[:ttl]
+          opts.ttl_specified = true
           idx = result[:next_idx]
         when "NX"
           opts.nx = true
@@ -486,8 +498,12 @@ module Redis
       end
 
       ttl = case mode
-            when :seconds           then Time.utc.to_unix_ms + (val * 1000)
-            when :milliseconds      then Time.utc.to_unix_ms + val
+            when :seconds
+              return {ttl: nil, error: "invalid expire time in 'set' command", next_idx: next_idx} if val <= 0
+              Time.utc.to_unix_ms + (val * 1000)
+            when :milliseconds
+              return {ttl: nil, error: "invalid expire time in 'set' command", next_idx: next_idx} if val <= 0
+              Time.utc.to_unix_ms + val
             when :unix_seconds      then val * 1000
             when :unix_milliseconds then val
             else                         val
@@ -509,6 +525,79 @@ module Redis
       else
         client.send_nil
       end
+    end
+
+    private def parse_count_argument(arg : RespValue?, client : Connection) : Int64?
+      value = extract_string(arg)
+      unless value
+        client.send_error("value is not an integer or out of range")
+        return nil
+      end
+
+      count = value.to_i64?
+      unless count
+        client.send_error("value is not an integer or out of range")
+        return nil
+      end
+
+      count
+    end
+
+    private def parse_positive_count_argument(arg : RespValue?, client : Connection) : Int32?
+      count = parse_count_argument(arg, client)
+      return nil unless count
+
+      if count <= 0 || count > Int32::MAX
+        client.send_error("value is out of range, must be positive")
+        return nil
+      end
+
+      count.to_i32
+    end
+
+    private def parse_scan_cursor(value : String, client : Connection) : Int64?
+      cursor = value.to_i64?
+      unless cursor && cursor >= 0
+        client.send_error("invalid cursor")
+        return nil
+      end
+
+      cursor
+    end
+
+    private def parse_scan_options(args : Array(RespValue), start_idx : Int32, client : Connection) : NamedTuple(pattern: String?, count: Int64, error: String?)
+      pattern : String? = nil
+      count = 10_i64
+      idx = start_idx
+
+      while idx < args.size
+        opt = extract_string(args[idx])
+        return {pattern: nil, count: count, error: "syntax error"} unless opt
+
+        case opt.upcase
+        when "MATCH"
+          idx += 1
+          return {pattern: nil, count: count, error: "syntax error"} if idx >= args.size
+
+          pattern = extract_string(args[idx])
+          return {pattern: nil, count: count, error: "syntax error"} unless pattern
+        when "COUNT"
+          idx += 1
+          return {pattern: nil, count: count, error: "syntax error"} if idx >= args.size
+
+          parsed_count = parse_count_argument(args[idx], client)
+          return {pattern: nil, count: count, error: "handled"} unless parsed_count
+          return {pattern: nil, count: count, error: "syntax error"} if parsed_count <= 0
+
+          count = parsed_count
+        else
+          return {pattern: nil, count: count, error: "syntax error"}
+        end
+
+        idx += 1
+      end
+
+      {pattern: pattern, count: count, error: nil}
     end
 
     private def handle_get(args : Array(RespValue), client : Connection) : Nil
@@ -947,81 +1036,78 @@ module Redis
 
         case opt.upcase
         when "EX"
-          if args.size < 3
-            client.send_error("syntax error")
-            return
-          end
+          return client.send_error("syntax error") unless args.size == 3
+
           seconds_str = extract_string(args[2])
-          unless seconds_str
-            client.send_error("syntax error")
-            return
-          end
+          return client.send_error("syntax error") unless seconds_str
+
           seconds = seconds_str.to_i64?
           unless seconds
             client.send_error("value is not an integer or out of range")
             return
           end
+          if seconds <= 0
+            client.send_error("invalid expire time in 'getex' command")
+            return
+          end
+
           if value
             ttl = Time.utc.to_unix_ms + (seconds * 1000)
             current_db(client).set(key, value, ttl)
           end
         when "PX"
-          if args.size < 3
-            client.send_error("syntax error")
-            return
-          end
+          return client.send_error("syntax error") unless args.size == 3
+
           ms_str = extract_string(args[2])
-          unless ms_str
-            client.send_error("syntax error")
-            return
-          end
+          return client.send_error("syntax error") unless ms_str
+
           ms = ms_str.to_i64?
           unless ms
             client.send_error("value is not an integer or out of range")
             return
           end
+          if ms <= 0
+            client.send_error("invalid expire time in 'getex' command")
+            return
+          end
+
           if value
             ttl = Time.utc.to_unix_ms + ms
             current_db(client).set(key, value, ttl)
           end
         when "EXAT"
-          if args.size < 3
-            client.send_error("syntax error")
-            return
-          end
+          return client.send_error("syntax error") unless args.size == 3
+
           timestamp_str = extract_string(args[2])
-          unless timestamp_str
-            client.send_error("syntax error")
-            return
-          end
+          return client.send_error("syntax error") unless timestamp_str
+
           timestamp = timestamp_str.to_i64?
           unless timestamp
             client.send_error("value is not an integer or out of range")
             return
           end
+
           if value
-            ttl = timestamp * 1000
-            current_db(client).set(key, value, ttl)
+            current_db(client).set(key, value, timestamp * 1000)
           end
         when "PXAT"
-          if args.size < 3
-            client.send_error("syntax error")
-            return
-          end
+          return client.send_error("syntax error") unless args.size == 3
+
           timestamp_str = extract_string(args[2])
-          unless timestamp_str
-            client.send_error("syntax error")
-            return
-          end
+          return client.send_error("syntax error") unless timestamp_str
+
           timestamp = timestamp_str.to_i64?
           unless timestamp
             client.send_error("value is not an integer or out of range")
             return
           end
+
           if value
             current_db(client).set(key, value, timestamp)
           end
         when "PERSIST"
+          return client.send_error("syntax error") unless args.size == 2
+
           if value
             current_db(client).set(key, value, nil)
           end
@@ -1069,6 +1155,34 @@ module Redis
       client.send_integer(current_db(client).size.to_i64)
     end
 
+    private def handle_config(args : Array(RespValue), client : Connection) : Nil
+      if args.size != 2
+        client.send_error("wrong number of arguments for 'config' command")
+        return
+      end
+
+      subcommand = extract_string(args[0])
+      pattern = extract_string(args[1])
+      return client.send_error("syntax error") unless subcommand && pattern
+
+      unless subcommand.upcase == "GET"
+        client.send_error("CONFIG subcommand must be GET")
+        return
+      end
+
+      matcher = GlobMatcher.compile(pattern)
+      result = [] of Bytes
+
+      {"save" => Bytes.empty, "appendonly" => "no".to_slice}.each do |name, value|
+        next unless matcher.matches?(name.to_slice)
+
+        result << name.to_slice
+        result << value
+      end
+
+      client.send_bytes_array(result)
+    end
+
     private def handle_flushdb(args : Array(RespValue), client : Connection) : Nil
       return if check_frozen(client)
       current_db(client).clear
@@ -1084,20 +1198,12 @@ module Redis
       pattern = extract_string(args[0])
       return client.send_error("Invalid pattern") unless pattern
 
-      keys = current_db(client).keys
-      results = Array(RespValue).new(keys.size)
-
-      if pattern == "*"
-        keys.each { |k| results << k.as(RespValue) }
-      else
-        regex = RegexCache.get(pattern)
-        keys.each do |k|
-          key_str = String.new(k)
-          results << k.as(RespValue) if regex.matches?(key_str)
-        end
-      end
-
-      client.send_array(results)
+      keys = if pattern == "*"
+               current_db(client).keys
+             else
+               current_db(client).keys_matching(pattern)
+             end
+      client.send_bytes_array(keys)
     end
 
     private def handle_info(args : Array(RespValue), client : Connection) : Nil
@@ -1188,6 +1294,7 @@ module Redis
       begin
         list = current_db(client).get_or_create_list(key)
         result = list.lpush(values)
+        current_db(client).mark_key_modified(key) unless values.empty?
         client.send_integer(result)
       rescue ex : WrongTypeError
         client.send_error(ex.message)
@@ -1209,6 +1316,7 @@ module Redis
       begin
         list = current_db(client).get_or_create_list(key)
         result = list.rpush(values)
+        current_db(client).mark_key_modified(key) unless values.empty?
         client.send_integer(result)
       rescue ex : WrongTypeError
         client.send_error(ex.message)
@@ -1234,6 +1342,7 @@ module Redis
 
         values = args[1..].compact_map { |arg| extract_bytes(arg) }
         result = list.lpush(values)
+        current_db(client).mark_key_modified(key) unless values.empty?
         client.send_integer(result)
       rescue ex : WrongTypeError
         client.send_error(ex.message)
@@ -1259,6 +1368,7 @@ module Redis
 
         values = args[1..].compact_map { |arg| extract_bytes(arg) }
         result = list.rpush(values)
+        current_db(client).mark_key_modified(key) unless values.empty?
         client.send_integer(result)
       rescue ex : WrongTypeError
         client.send_error(ex.message)
@@ -1267,7 +1377,7 @@ module Redis
 
     private def handle_lpop(args : Array(RespValue), client : Connection) : Nil
       return if check_frozen(client)
-      if args.empty?
+      if args.empty? || args.size > 2
         client.send_error("wrong number of arguments for 'lpop' command")
         return
       end
@@ -1277,8 +1387,9 @@ module Redis
 
       count = 1
       if args.size > 1
-        count_str = extract_string(args[1])
-        count = count_str.to_i? || 1 if count_str
+        parsed_count = parse_positive_count_argument(args[1]?, client)
+        return unless parsed_count
+        count = parsed_count
       end
 
       begin
@@ -1289,6 +1400,7 @@ module Redis
         end
 
         result = list.lpop(count)
+        current_db(client).mark_key_modified(key) unless result.empty?
         current_db(client).cleanup_empty(key)
 
         if args.size > 1
@@ -1306,7 +1418,7 @@ module Redis
 
     private def handle_rpop(args : Array(RespValue), client : Connection) : Nil
       return if check_frozen(client)
-      if args.empty?
+      if args.empty? || args.size > 2
         client.send_error("wrong number of arguments for 'rpop' command")
         return
       end
@@ -1316,8 +1428,9 @@ module Redis
 
       count = 1
       if args.size > 1
-        count_str = extract_string(args[1])
-        count = count_str.to_i? || 1 if count_str
+        parsed_count = parse_positive_count_argument(args[1]?, client)
+        return unless parsed_count
+        count = parsed_count
       end
 
       begin
@@ -1328,6 +1441,7 @@ module Redis
         end
 
         result = list.rpop(count)
+        current_db(client).mark_key_modified(key) unless result.empty?
         current_db(client).cleanup_empty(key)
 
         if args.size > 1
@@ -1417,6 +1531,7 @@ module Redis
         end
 
         if list.lset(index, value)
+          current_db(client).mark_key_modified(key)
           client.send_ok
         else
           client.send_error("index out of range")
@@ -1447,13 +1562,12 @@ module Redis
       begin
         list = current_db(client).get_list(key)
         unless list
-          client.send_array([] of RespValue)
+          client.send_bytes_array([] of Bytes)
           return
         end
 
         result = list.lrange(start_idx, end_idx)
-        arr = result.map { |val| val.as(RespValue) }
-        client.send_array(arr)
+        client.send_bytes_array(result)
       rescue ex : WrongTypeError
         client.send_error(ex.message)
       end
@@ -1488,6 +1602,7 @@ module Redis
         end
 
         result = list.linsert(pivot, value, before)
+        current_db(client).mark_key_modified(key) if result > 0
         client.send_integer(result)
       rescue ex : WrongTypeError
         client.send_error(ex.message)
@@ -1512,24 +1627,88 @@ module Redis
       idx = 2
       while idx < args.size
         opt = extract_string(args[idx])
-        break unless opt
+        unless opt
+          client.send_error("syntax error")
+          return
+        end
 
         case opt.upcase
         when "RANK"
           idx += 1
-          rank_str = extract_string(args[idx]?) if idx < args.size
-          rank = rank_str.to_i64? || 1_i64 if rank_str
+          if idx >= args.size
+            client.send_error("syntax error")
+            return
+          end
+
+          rank_str = extract_string(args[idx])
+          unless rank_str
+            client.send_error("syntax error")
+            return
+          end
+
+          parsed_rank = rank_str.to_i64?
+          unless parsed_rank
+            client.send_error("value is not an integer or out of range")
+            return
+          end
+          if parsed_rank == 0
+            client.send_error("RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative to start from the end of the list")
+            return
+          end
+
+          rank = parsed_rank
         when "COUNT"
           idx += 1
-          count_str = extract_string(args[idx]?) if idx < args.size
-          if count_str
-            count = count_str.to_i64? || 1_i64
-            return_count = true
+          if idx >= args.size
+            client.send_error("syntax error")
+            return
           end
+
+          count_str = extract_string(args[idx])
+          unless count_str
+            client.send_error("syntax error")
+            return
+          end
+
+          parsed_count = count_str.to_i64?
+          unless parsed_count
+            client.send_error("value is not an integer or out of range")
+            return
+          end
+          if parsed_count < 0
+            client.send_error("COUNT can't be negative")
+            return
+          end
+
+          count = parsed_count
+          return_count = true
         when "MAXLEN"
           idx += 1
-          maxlen_str = extract_string(args[idx]?) if idx < args.size
-          maxlen = maxlen_str.to_i64? || 0_i64 if maxlen_str
+          if idx >= args.size
+            client.send_error("syntax error")
+            return
+          end
+
+          maxlen_str = extract_string(args[idx])
+          unless maxlen_str
+            client.send_error("syntax error")
+            return
+          end
+
+          parsed_maxlen = maxlen_str.to_i64?
+          unless parsed_maxlen
+            client.send_error("value is not an integer or out of range")
+            return
+          end
+          if parsed_maxlen < 0
+            client.send_error("MAXLEN can't be negative")
+            return
+          end
+
+          maxlen = parsed_maxlen
+        else
+          client.send_error("syntax error")
+          return
         end
         idx += 1
       end
@@ -1586,6 +1765,7 @@ module Redis
         end
 
         result = list.lrem(count, element)
+        current_db(client).mark_key_modified(key) if result > 0
         current_db(client).cleanup_empty(key)
         client.send_integer(result)
       rescue ex : WrongTypeError
@@ -1620,6 +1800,7 @@ module Redis
         end
 
         list.ltrim(start_idx, end_idx)
+        current_db(client).mark_key_modified(key)
         current_db(client).cleanup_empty(key)
         client.send_ok
       rescue ex : WrongTypeError
@@ -1665,6 +1846,10 @@ module Redis
 
         dst_list = current_db(client).get_or_create_list(dst_key)
         result = src_list.lmove(dst_list, wherefrom, whereto)
+        if result
+          current_db(client).mark_key_modified(src_key)
+          current_db(client).mark_key_modified(dst_key) unless src_key == dst_key
+        end
         current_db(client).cleanup_empty(src_key)
 
         client.send_bulk_string(result)
@@ -1697,6 +1882,7 @@ module Redis
           idx += 2
         end
 
+        current_db(client).mark_key_modified(key)
         client.send_integer(added)
       rescue ex : WrongTypeError
         client.send_error(ex.message)
@@ -1748,6 +1934,7 @@ module Redis
           idx += 2
         end
 
+        current_db(client).mark_key_modified(key)
         client.send_ok
       rescue ex : WrongTypeError
         client.send_error(ex.message)
@@ -1802,6 +1989,7 @@ module Redis
 
         fields = args[1..].compact_map { |arg| extract_bytes(arg) }
         result = hash.hdel(fields)
+        current_db(client).mark_key_modified(key) if result > 0
         current_db(client).cleanup_empty(key)
         client.send_integer(result)
       rescue ex : WrongTypeError
@@ -1936,6 +2124,7 @@ module Redis
       begin
         hash = current_db(client).get_or_create_hash(key)
         result = hash.hincrby(field, increment)
+        current_db(client).mark_key_modified(key)
         client.send_integer(result)
       rescue ex : WrongTypeError
         client.send_error(ex.message)
@@ -1965,6 +2154,7 @@ module Redis
       begin
         hash = current_db(client).get_or_create_hash(key)
         result = hash.hincrbyfloat(field, increment)
+        current_db(client).mark_key_modified(key)
         client.send_bulk_string(result.to_s.to_slice)
       rescue ex : WrongTypeError
         client.send_error(ex.message)
@@ -1988,6 +2178,7 @@ module Redis
       begin
         hash = current_db(client).get_or_create_hash(key)
         result = hash.hsetnx(field, value) ? 1_i64 : 0_i64
+        current_db(client).mark_key_modified(key) if result == 1_i64
         client.send_integer(result)
       rescue ex : WrongTypeError
         client.send_error(ex.message)
@@ -2028,6 +2219,7 @@ module Redis
       begin
         set = current_db(client).get_or_create_set(key)
         result = set.sadd(members)
+        current_db(client).mark_key_modified(key) if result > 0
         client.send_integer(result)
       rescue ex : WrongTypeError
         client.send_error(ex.message)
@@ -2053,6 +2245,7 @@ module Redis
 
         members = args[1..].compact_map { |arg| extract_bytes(arg) }
         result = set.srem(members)
+        current_db(client).mark_key_modified(key) if result > 0
         current_db(client).cleanup_empty(key)
         client.send_integer(result)
       rescue ex : WrongTypeError
@@ -2147,7 +2340,7 @@ module Redis
 
     private def handle_spop(args : Array(RespValue), client : Connection) : Nil
       return if check_frozen(client)
-      if args.empty?
+      if args.empty? || args.size > 2
         client.send_error("wrong number of arguments for 'spop' command")
         return
       end
@@ -2157,8 +2350,9 @@ module Redis
 
       count = 1
       if args.size > 1
-        count_str = extract_string(args[1])
-        count = count_str.to_i? || 1 if count_str
+        parsed_count = parse_positive_count_argument(args[1]?, client)
+        return unless parsed_count
+        count = parsed_count
       end
 
       begin
@@ -2173,6 +2367,7 @@ module Redis
         end
 
         result = set.spop(count)
+        current_db(client).mark_key_modified(key) unless result.empty?
         current_db(client).cleanup_empty(key)
 
         if args.size > 1
@@ -2189,7 +2384,7 @@ module Redis
     end
 
     private def handle_srandmember(args : Array(RespValue), client : Connection) : Nil
-      if args.empty?
+      if args.empty? || args.size > 2
         client.send_error("wrong number of arguments for 'srandmember' command")
         return
       end
@@ -2200,8 +2395,9 @@ module Redis
       count = 1_i64
       return_array = false
       if args.size > 1
-        count_str = extract_string(args[1])
-        count = count_str.to_i64? || 1_i64 if count_str
+        parsed_count = parse_count_argument(args[1]?, client)
+        return unless parsed_count
+        count = parsed_count
         return_array = true
       end
 
@@ -2336,17 +2532,25 @@ module Redis
       return client.send_error("Invalid key") unless dest_key
 
       begin
-        result_set = current_db(client).get_or_create_set(dest_key)
+        result_members = [] of Bytes
 
         args[1..].each do |arg|
           k = extract_bytes(arg)
           next unless k
           set = current_db(client).get_set(k)
           if set
-            set.smembers.each { |member| result_set.sadd([member]) }
+            set.smembers.each { |member| result_members << member unless result_members.includes?(member) }
           end
         end
 
+        current_db(client).del(dest_key)
+        if result_members.empty?
+          client.send_integer(0_i64)
+          return
+        end
+
+        result_set = current_db(client).get_or_create_set(dest_key)
+        result_set.sadd(result_members)
         client.send_integer(result_set.scard)
       rescue ex : WrongTypeError
         client.send_error(ex.message)
@@ -2467,6 +2671,10 @@ module Redis
 
         dest_set = current_db(client).get_or_create_set(dest_key)
         result = src_set.smove(dest_set, member) ? 1_i64 : 0_i64
+        if result == 1_i64
+          current_db(client).mark_key_modified(src_key)
+          current_db(client).mark_key_modified(dest_key) unless src_key == dest_key
+        end
         current_db(client).cleanup_empty(src_key)
         client.send_integer(result)
       rescue ex : WrongTypeError
@@ -2538,11 +2746,12 @@ module Redis
           end
 
           if incr
-            handle_zadd_incr(zset, member, score, nx, xx, client)
+            handle_zadd_incr(key, zset, member, score, nx, xx, client)
             return
           end
 
-          result, _ = zset.zadd(member, score, nx, xx, gt, lt, ch)
+          result, changed = zset.zadd(member, score, nx, xx, gt, lt, ch)
+          current_db(client).mark_key_modified(key) if changed
           added += result
           idx += 2
         end
@@ -2553,7 +2762,7 @@ module Redis
       end
     end
 
-    private def handle_zadd_incr(zset : SortedSetType, member : Bytes, score : Float64, nx : Bool, xx : Bool, client : Connection) : Nil
+    private def handle_zadd_incr(key : Bytes, zset : SortedSetType, member : Bytes, score : Float64, nx : Bool, xx : Bool, client : Connection) : Nil
       member_exists = zset.zscore(member) != nil
       if nx && member_exists
         client.send_nil
@@ -2564,6 +2773,7 @@ module Redis
         return
       end
       result = zset.zincrby(member, score)
+      current_db(client).mark_key_modified(key)
       client.send_bulk_string(result.to_s.to_slice)
     end
 
@@ -2586,6 +2796,7 @@ module Redis
 
         members = args[1..].compact_map { |arg| extract_bytes(arg) }
         result = zset.zrem(members)
+        current_db(client).mark_key_modified(key) if result > 0
         current_db(client).cleanup_empty(key)
         client.send_integer(result)
       rescue ex : WrongTypeError
@@ -2706,8 +2917,17 @@ module Redis
       max_str = extract_string(args[2])
       return client.send_error("Invalid arguments") unless key && min_str && max_str
 
-      min_val, min_exclusive = parse_score_bound(min_str, Float64::MIN)
-      max_val, max_exclusive = parse_score_bound(max_str, Float64::MAX)
+      min_bound = parse_score_bound(min_str)
+      max_bound = parse_score_bound(max_str)
+      if min_bound[:error] || max_bound[:error]
+        client.send_error("min or max is not a float")
+        return
+      end
+
+      min_val = min_bound[:value] || 0.0
+      min_exclusive = min_bound[:exclusive]
+      max_val = max_bound[:value] || 0.0
+      max_exclusive = max_bound[:exclusive]
 
       begin
         zset = current_db(client).get_sorted_set(key)
@@ -2736,12 +2956,15 @@ module Redis
         return
       end
 
-      withscores = if args.size > 3
-                     opt = extract_string(args[3])
-                     !!(opt && opt.upcase == "WITHSCORES")
-                   else
-                     false
-                   end
+      withscores = false
+      if args.size > 3
+        opt = extract_string(args[3])
+        unless opt && opt.upcase == "WITHSCORES" && args.size == 4
+          client.send_error("syntax error")
+          return
+        end
+        withscores = true
+      end
 
       begin
         zset = current_db(client).get_sorted_set(key)
@@ -2782,12 +3005,15 @@ module Redis
         return
       end
 
-      withscores = if args.size > 3
-                     opt = extract_string(args[3])
-                     !!(opt && opt.upcase == "WITHSCORES")
-                   else
-                     false
-                   end
+      withscores = false
+      if args.size > 3
+        opt = extract_string(args[3])
+        unless opt && opt.upcase == "WITHSCORES" && args.size == 4
+          client.send_error("syntax error")
+          return
+        end
+        withscores = true
+      end
 
       begin
         zset = current_db(client).get_sorted_set(key)
@@ -2821,8 +3047,17 @@ module Redis
       max_str = extract_string(args[2])
       return client.send_error("Invalid arguments") unless key && min_str && max_str
 
-      min_val, min_exclusive = parse_score_bound(min_str, Float64::MIN)
-      max_val, max_exclusive = parse_score_bound(max_str, Float64::MAX)
+      min_bound = parse_score_bound(min_str)
+      max_bound = parse_score_bound(max_str)
+      if min_bound[:error] || max_bound[:error]
+        client.send_error("min or max is not a float")
+        return
+      end
+
+      min_val = min_bound[:value] || 0.0
+      min_exclusive = min_bound[:exclusive]
+      max_val = max_bound[:value] || 0.0
+      max_exclusive = max_bound[:exclusive]
 
       withscores = false
       offset = 0_i64
@@ -2831,19 +3066,41 @@ module Redis
       idx = 3
       while idx < args.size
         opt = extract_string(args[idx])
-        break unless opt
+        unless opt
+          client.send_error("syntax error")
+          return
+        end
+
         case opt.upcase
         when "WITHSCORES"
           withscores = true
           idx += 1
         when "LIMIT"
-          offset_str = extract_string(args[idx + 1]?) if idx + 1 < args.size
-          count_str = extract_string(args[idx + 2]?) if idx + 2 < args.size
-          offset = offset_str.to_i64? || 0_i64 if offset_str
-          count = count_str.to_i64? || -1_i64 if count_str
+          if idx + 2 >= args.size
+            client.send_error("syntax error")
+            return
+          end
+
+          offset_str = extract_string(args[idx + 1])
+          count_str = extract_string(args[idx + 2])
+          unless offset_str && count_str
+            client.send_error("syntax error")
+            return
+          end
+
+          parsed_offset = offset_str.to_i64?
+          parsed_count = count_str.to_i64?
+          unless parsed_offset && parsed_count
+            client.send_error("value is not an integer or out of range")
+            return
+          end
+
+          offset = parsed_offset
+          count = parsed_count
           idx += 3
         else
-          idx += 1
+          client.send_error("syntax error")
+          return
         end
       end
 
@@ -2889,6 +3146,7 @@ module Redis
       begin
         zset = current_db(client).get_or_create_sorted_set(key)
         result = zset.zincrby(member, increment)
+        current_db(client).mark_key_modified(key)
         client.send_bulk_string(result.to_s.to_slice)
       rescue ex : WrongTypeError
         client.send_error(ex.message)
@@ -2897,7 +3155,7 @@ module Redis
 
     private def handle_zpopmin(args : Array(RespValue), client : Connection) : Nil
       return if check_frozen(client)
-      if args.empty?
+      if args.empty? || args.size > 2
         client.send_error("wrong number of arguments for 'zpopmin' command")
         return
       end
@@ -2907,8 +3165,9 @@ module Redis
 
       count = 1
       if args.size > 1
-        count_str = extract_string(args[1])
-        count = count_str.to_i? || 1 if count_str
+        parsed_count = parse_positive_count_argument(args[1]?, client)
+        return unless parsed_count
+        count = parsed_count
       end
 
       begin
@@ -2919,6 +3178,7 @@ module Redis
         end
 
         result = zset.zpopmin(count)
+        current_db(client).mark_key_modified(key) unless result.empty?
         current_db(client).cleanup_empty(key)
 
         arr = [] of RespValue
@@ -2934,7 +3194,7 @@ module Redis
 
     private def handle_zpopmax(args : Array(RespValue), client : Connection) : Nil
       return if check_frozen(client)
-      if args.empty?
+      if args.empty? || args.size > 2
         client.send_error("wrong number of arguments for 'zpopmax' command")
         return
       end
@@ -2944,8 +3204,9 @@ module Redis
 
       count = 1
       if args.size > 1
-        count_str = extract_string(args[1])
-        count = count_str.to_i? || 1 if count_str
+        parsed_count = parse_positive_count_argument(args[1]?, client)
+        return unless parsed_count
+        count = parsed_count
       end
 
       begin
@@ -2956,6 +3217,7 @@ module Redis
         end
 
         result = zset.zpopmax(count)
+        current_db(client).mark_key_modified(key) unless result.empty?
         current_db(client).cleanup_empty(key)
 
         arr = [] of RespValue
@@ -3042,35 +3304,39 @@ module Redis
       key = extract_bytes(args[0])
       return client.send_error("Invalid key") unless key
 
-      count = 1_i64
+      count : Int64? = nil
       withscores = false
+      count_requested = false
 
-      idx = 1
-      while idx < args.size
-        opt = extract_string(args[idx])
-        break unless opt
-        case opt.upcase
-        when "COUNT"
-          idx += 1
-          if idx < args.size
-            count_str = extract_string(args[idx]?)
-            if count_str
-              parsed = count_str.to_i64?
-              count = parsed if parsed
-            end
-          end
-        when "WITHSCORES"
-          withscores = true
-          idx += 1
-        else
-          idx += 1
+      if args.size > 1
+        count = parse_count_argument(args[1]?, client)
+        return unless count
+        count_requested = true
+      end
+
+      if args.size > 2
+        opt = extract_string(args[2])
+        unless opt && opt.upcase == "WITHSCORES"
+          client.send_error("syntax error")
+          return
         end
+        withscores = true
+      end
+
+      if args.size > 3
+        client.send_error("syntax error")
+        return
+      end
+
+      if withscores && count.nil?
+        client.send_error("value is not an integer or out of range")
+        return
       end
 
       begin
         zset = current_db(client).get_sorted_set(key)
         unless zset
-          if withscores
+          if withscores || count_requested
             client.send_array([] of RespValue)
           else
             client.send_nil
@@ -3078,7 +3344,7 @@ module Redis
           return
         end
 
-        result = zset.zrandmember(count, withscores)
+        result = zset.zrandmember(count || 1_i64, withscores)
 
         if withscores
           arr = result.map do |val|
@@ -3089,11 +3355,13 @@ module Redis
             end
           end
           client.send_array(arr)
+        elsif count_requested
+          arr = result.map { |val| val.as(RespValue) }
+          client.send_array(arr)
         elsif result.empty?
           client.send_nil
         else
-          arr = result.map { |val| val.as(RespValue) }
-          client.send_array(arr)
+          client.send_bulk_string(result.first.as(Bytes))
         end
       rescue ex : WrongTypeError
         client.send_error(ex.message)
@@ -3128,17 +3396,20 @@ module Redis
     end
 
     # Returns {value, is_exclusive}
-    private def parse_score_bound(str : String, default : Float64) : {Float64, Bool}
+    private def parse_score_bound(str : String) : NamedTuple(value: Float64?, exclusive: Bool, error: String?)
       case str
-      when "-inf" then {Float64::MIN, false}
-      when "+inf" then {Float64::MAX, false}
-      when "inf"  then {Float64::MAX, false}
+      when "-inf" then {value: -Float64::INFINITY, exclusive: false, error: nil}
+      when "+inf" then {value: Float64::INFINITY, exclusive: false, error: nil}
+      when "inf"  then {value: Float64::INFINITY, exclusive: false, error: nil}
       else
         if str.starts_with?("(")
           val = str[1..].to_f64?
-          {val || default, true}
+          return {value: nil, exclusive: true, error: "min or max is not a float"} unless val
+          {value: val, exclusive: true, error: nil}
         else
-          {str.to_f64? || default, false}
+          val = str.to_f64?
+          return {value: nil, exclusive: false, error: "min or max is not a float"} unless val
+          {value: val, exclusive: false, error: nil}
         end
       end
     end
@@ -3432,7 +3703,7 @@ module Redis
 
     private def handle_expire(args : Array(RespValue), client : Connection) : Nil
       return if check_frozen(client)
-      if args.size < 2
+      if args.size != 2
         client.send_error("wrong number of arguments for 'expire' command")
         return
       end
@@ -3451,7 +3722,7 @@ module Redis
 
     private def handle_expireat(args : Array(RespValue), client : Connection) : Nil
       return if check_frozen(client)
-      if args.size < 2
+      if args.size != 2
         client.send_error("wrong number of arguments for 'expireat' command")
         return
       end
@@ -3470,7 +3741,7 @@ module Redis
 
     private def handle_pexpire(args : Array(RespValue), client : Connection) : Nil
       return if check_frozen(client)
-      if args.size < 2
+      if args.size != 2
         client.send_error("wrong number of arguments for 'pexpire' command")
         return
       end
@@ -3489,7 +3760,7 @@ module Redis
 
     private def handle_pexpireat(args : Array(RespValue), client : Connection) : Nil
       return if check_frozen(client)
-      if args.size < 2
+      if args.size != 2
         client.send_error("wrong number of arguments for 'pexpireat' command")
         return
       end
@@ -3594,34 +3865,18 @@ module Redis
       cursor_str = extract_string(args[0])
       return client.send_error("Invalid cursor") unless cursor_str
 
-      cursor = cursor_str.to_i64? || 0_i64
-      pattern : String? = nil
-      count = 10_i64
+      cursor = parse_scan_cursor(cursor_str, client)
+      return unless cursor
 
-      # Parse optional MATCH and COUNT
-      idx = 1
-      while idx < args.size
-        opt = extract_string(args[idx]).try(&.upcase)
-        case opt
-        when "MATCH"
-          pattern = extract_string(args[idx + 1]?) if idx + 1 < args.size
-          idx += 2
-        when "COUNT"
-          count = extract_string(args[idx + 1]?).try(&.to_i64) || 10_i64
-          idx += 2
-        else
-          idx += 1
-        end
+      options = parse_scan_options(args, 1, client)
+      if error = options[:error]
+        client.send_error(error) unless error == "handled"
+        return
       end
 
-      next_cursor, keys = current_db(client).scan(cursor, pattern, count)
+      next_cursor, keys = current_db(client).scan(cursor, options[:pattern], options[:count])
 
-      # Return as array of [cursor_string, [keys...]]
-      result = Array(RespValue).new(2) # SCAN returns exactly 2 elements
-      result << next_cursor.to_s.to_slice.as(RespValue)
-      key_arr = keys.map { |k| k.as(RespValue) }
-      result << key_arr.as(RespValue)
-      client.send_array(result)
+      client.send_cursor_bytes_array(next_cursor.to_s.to_slice, keys)
     end
 
     private def handle_hscan(args : Array(RespValue), client : Connection) : Nil
@@ -3634,43 +3889,24 @@ module Redis
       cursor_str = extract_string(args[1])
       return client.send_error("Invalid arguments") unless key && cursor_str
 
-      cursor = cursor_str.to_i64? || 0_i64
-      pattern : String? = nil
-      count = 10_i64
+      cursor = parse_scan_cursor(cursor_str, client)
+      return unless cursor
 
-      # Parse optional MATCH and COUNT
-      idx = 2
-      while idx < args.size
-        opt = extract_string(args[idx]).try(&.upcase)
-        case opt
-        when "MATCH"
-          pattern = extract_string(args[idx + 1]?) if idx + 1 < args.size
-          idx += 2
-        when "COUNT"
-          count = extract_string(args[idx + 1]?).try(&.to_i64) || 10_i64
-          idx += 2
-        else
-          idx += 1
-        end
+      options = parse_scan_options(args, 2, client)
+      if error = options[:error]
+        client.send_error(error) unless error == "handled"
+        return
       end
 
       begin
         hash = current_db(client).get_hash(key)
         unless hash
-          result = Array(RespValue).new(2) # Empty HSCAN returns 2 elements
-          result << "0".to_slice.as(RespValue)
-          result << ([] of RespValue).as(RespValue)
-          client.send_array(result)
+          client.send_cursor_bytes_array("0".to_slice, [] of Bytes)
           return
         end
 
-        next_cursor, items = hash.hscan(cursor, pattern, count)
-
-        result = Array(RespValue).new(2) # HSCAN returns exactly 2 elements
-        result << next_cursor.to_s.to_slice.as(RespValue)
-        item_arr = items.map { |item| item.as(RespValue) }
-        result << item_arr.as(RespValue)
-        client.send_array(result)
+        next_cursor, items = hash.hscan(cursor, options[:pattern], options[:count])
+        client.send_cursor_bytes_array(next_cursor.to_s.to_slice, items)
       rescue ex : WrongTypeError
         client.send_error(ex.message)
       end
@@ -3686,43 +3922,24 @@ module Redis
       cursor_str = extract_string(args[1])
       return client.send_error("Invalid arguments") unless key && cursor_str
 
-      cursor = cursor_str.to_i64? || 0_i64
-      pattern : String? = nil
-      count = 10_i64
+      cursor = parse_scan_cursor(cursor_str, client)
+      return unless cursor
 
-      # Parse optional MATCH and COUNT
-      idx = 2
-      while idx < args.size
-        opt = extract_string(args[idx]).try(&.upcase)
-        case opt
-        when "MATCH"
-          pattern = extract_string(args[idx + 1]?) if idx + 1 < args.size
-          idx += 2
-        when "COUNT"
-          count = extract_string(args[idx + 1]?).try(&.to_i64) || 10_i64
-          idx += 2
-        else
-          idx += 1
-        end
+      options = parse_scan_options(args, 2, client)
+      if error = options[:error]
+        client.send_error(error) unless error == "handled"
+        return
       end
 
       begin
         set = current_db(client).get_set(key)
         unless set
-          result = Array(RespValue).new(2) # Empty SSCAN returns 2 elements
-          result << "0".to_slice.as(RespValue)
-          result << ([] of RespValue).as(RespValue)
-          client.send_array(result)
+          client.send_cursor_bytes_array("0".to_slice, [] of Bytes)
           return
         end
 
-        next_cursor, members = set.sscan(cursor, pattern, count)
-
-        result = Array(RespValue).new(2) # SSCAN returns exactly 2 elements
-        result << next_cursor.to_s.to_slice.as(RespValue)
-        member_arr = members.map { |member| member.as(RespValue) }
-        result << member_arr.as(RespValue)
-        client.send_array(result)
+        next_cursor, members = set.sscan(cursor, options[:pattern], options[:count])
+        client.send_cursor_bytes_array(next_cursor.to_s.to_slice, members)
       rescue ex : WrongTypeError
         client.send_error(ex.message)
       end
@@ -3738,24 +3955,13 @@ module Redis
       cursor_str = extract_string(args[1])
       return client.send_error("Invalid arguments") unless key && cursor_str
 
-      cursor = cursor_str.to_i64? || 0_i64
-      pattern : String? = nil
-      count = 10_i64
+      cursor = parse_scan_cursor(cursor_str, client)
+      return unless cursor
 
-      # Parse optional MATCH and COUNT
-      idx = 2
-      while idx < args.size
-        opt = extract_string(args[idx]).try(&.upcase)
-        case opt
-        when "MATCH"
-          pattern = extract_string(args[idx + 1]?) if idx + 1 < args.size
-          idx += 2
-        when "COUNT"
-          count = extract_string(args[idx + 1]?).try(&.to_i64) || 10_i64
-          idx += 2
-        else
-          idx += 1
-        end
+      options = parse_scan_options(args, 2, client)
+      if error = options[:error]
+        client.send_error(error) unless error == "handled"
+        return
       end
 
       begin
@@ -3768,7 +3974,7 @@ module Redis
           return
         end
 
-        next_cursor, items = zset.zscan(cursor, pattern, count)
+        next_cursor, items = zset.zscan(cursor, options[:pattern], options[:count])
 
         result = Array(RespValue).new(2) # ZSCAN returns exactly 2 elements
         result << next_cursor.to_s.to_slice.as(RespValue)

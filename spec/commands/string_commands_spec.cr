@@ -335,6 +335,44 @@ Spectator.describe "String Commands" do
     end
   end
 
+  describe "GETEX" do
+    it "returns the value and updates expiry" do
+      db.set(b("key"), b("value"))
+
+      handler.execute(cmd("GETEX", "key", "EX", "100"), conn)
+      expect(conn.last_response).to eq(b("value"))
+      expect(db.ttl(b("key"))).to be >= 95_i64
+    end
+
+    it "returns a syntax error for extra arguments" do
+      db.set(b("key"), b("value"))
+
+      handler.execute(cmd("GETEX", "key", "EX", "10", "junk"), conn)
+      expect(conn.last_error).to contain("syntax error")
+    end
+
+    it "returns an error for non-positive EX values" do
+      db.set(b("key"), b("value"))
+
+      handler.execute(cmd("GETEX", "key", "EX", "0"), conn)
+      expect(conn.last_error).to contain("invalid expire time")
+    end
+  end
+
+  describe "SET option validation" do
+    it "rejects KEEPTTL combined with EX" do
+      db.set(b("key"), b("value"), Time.utc.to_unix_ms + 10_000)
+
+      handler.execute(cmd("SET", "key", "new", "EX", "10", "KEEPTTL"), conn)
+      expect(conn.last_error).to contain("syntax error")
+    end
+
+    it "rejects non-positive EX values" do
+      handler.execute(cmd("SET", "key", "value", "EX", "0"), conn)
+      expect(conn.last_error).to contain("invalid expire time")
+    end
+  end
+
   describe "GETDEL" do
     it "gets and deletes value" do
       db.set(b("key"), b("value"))

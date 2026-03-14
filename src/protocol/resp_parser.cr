@@ -1,5 +1,12 @@
 module Redis
-  alias RespValue = String | Int64 | Bytes | Array(RespValue) | Bool | Float64 | Nil | Hash(RespValue, RespValue) | Set(RespValue)
+  struct RespError
+    getter message : String
+
+    def initialize(@message : String)
+    end
+  end
+
+  alias RespValue = String | Int64 | Bytes | Array(RespValue) | Bool | Float64 | Nil | Hash(RespValue, RespValue) | Set(RespValue) | RespError
 
   class ParseError < Exception
   end
@@ -99,7 +106,7 @@ module Redis
 
       data = Bytes.new(length)
       @io.read_fully(data)
-      @io.skip(2)
+      read_crlf
 
       data
     end
@@ -118,8 +125,17 @@ module Redis
     end
 
     private def parse_null : Nil
-      @io.skip(2)
+      read_crlf
       nil
+    end
+
+    private def read_crlf : Nil
+      cr = @io.read_byte
+      lf = @io.read_byte
+
+      unless cr == '\r'.ord.to_u8 && lf == '\n'.ord.to_u8
+        raise ParseError.new("Expected CRLF")
+      end
     end
 
     private def parse_boolean : Bool

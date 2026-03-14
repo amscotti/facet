@@ -31,6 +31,14 @@ Spectator.describe "Key Commands" do
       handler.execute(cmd("EXPIRE", "mykey", "200"), conn)
       expect(conn.last_response).to eq(1_i64)
     end
+
+    it "deletes the key immediately when TTL is zero" do
+      db.set(b("mykey"), b("myvalue"))
+
+      handler.execute(cmd("EXPIRE", "mykey", "0"), conn)
+      expect(conn.last_response).to eq(1_i64)
+      expect(db.exists?(b("mykey"))).to be_false
+    end
   end
 
   describe "EXPIREAT" do
@@ -58,6 +66,14 @@ Spectator.describe "Key Commands" do
     it "returns 0 for non-existing key" do
       handler.execute(cmd("PEXPIRE", "nonexistent", "100000"), conn)
       expect(conn.last_response).to eq(0_i64)
+    end
+
+    it "deletes the key immediately when TTL is non-positive" do
+      db.set(b("mykey"), b("myvalue"))
+
+      handler.execute(cmd("PEXPIRE", "mykey", "0"), conn)
+      expect(conn.last_response).to eq(1_i64)
+      expect(db.exists?(b("mykey"))).to be_false
     end
   end
 

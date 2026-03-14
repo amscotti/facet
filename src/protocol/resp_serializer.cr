@@ -12,6 +12,8 @@ module Redis
 
     def self.serialize(value : RespValue) : Bytes
       case value
+      when RespError
+        serialize_error(value.message)
       when String
         serialize_simple_string(value)
       when Int64
@@ -35,12 +37,42 @@ module Redis
       end
     end
 
+    def self.serialize_bytes_array(arr : Array(Bytes)) : Bytes
+      estimated_size = 16 + arr.sum(0) { |value| 16 + value.size }
+      result = IO::Memory.new(estimated_size)
+      write_bytes_array(result, arr)
+
+      result.to_slice
+    end
+
+    def self.serialize_cursor_bytes_array(cursor : Bytes, items : Array(Bytes)) : Bytes
+      estimated_size = 32 + cursor.size + items.sum(0) { |value| 16 + value.size }
+      result = IO::Memory.new(estimated_size)
+      write_cursor_bytes_array(result, cursor, items)
+
+      result.to_slice
+    end
+
+    def self.write_bytes_array(io : IO, arr : Array(Bytes)) : Nil
+      io << "*#{arr.size}\r\n"
+
+      arr.each do |value|
+        write_bulk_string(io, value)
+      end
+    end
+
+    def self.write_cursor_bytes_array(io : IO, cursor : Bytes, items : Array(Bytes)) : Nil
+      io << "*2\r\n"
+      write_bulk_string(io, cursor)
+      write_bytes_array(io, items)
+    end
+
     private def self.serialize_simple_string(str : String) : Bytes
       ("+" + str + "\r\n").to_slice
     end
 
     private def self.serialize_error(str : String) : Bytes
-      "-#{str}\r\n".to_slice
+      "-ERR #{str}\r\n".to_slice
     end
 
     private def self.serialize_integer(num : Int64) : Bytes
@@ -51,9 +83,7 @@ module Redis
       # Pre-allocate with estimated size to reduce reallocations
       estimated_size = 16 + bytes.size # "$" + size digits + CRLF + data + CRLF
       result = IO::Memory.new(estimated_size)
-      result << "$#{bytes.size}\r\n"
-      result.write(bytes)
-      result << "\r\n"
+      write_bulk_string(result, bytes)
       result.to_slice
     end
 
@@ -159,6 +189,12 @@ module Redis
       result = IO::Memory.new(estimated_size)
       result << "=#{str.bytesize + 4}\r\n#{format}:#{str}\r\n"
       result.to_slice
+    end
+
+    private def self.write_bulk_string(io : IO, bytes : Bytes) : Nil
+      io << "$#{bytes.size}\r\n"
+      io.write(bytes)
+      io << "\r\n"
     end
   end
 end

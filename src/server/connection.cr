@@ -142,6 +142,16 @@ module Redis
     def send_array(arr : Array(RespValue)) : Nil
       send_response(arr)
     end
+
+    def send_bytes_array(arr : Array(Bytes)) : Nil
+      write(RespSerializer.serialize_bytes_array(arr))
+      flush
+    end
+
+    def send_cursor_bytes_array(cursor : Bytes, items : Array(Bytes)) : Nil
+      write(RespSerializer.serialize_cursor_bytes_array(cursor, items))
+      flush
+    end
   end
 
   # Wrapper connection that captures responses instead of sending them
@@ -165,8 +175,7 @@ module Redis
     end
 
     def send_error(message : String?) : Nil
-      # Store error as a special format
-      @captured_response = "-ERR #{message || "unknown error"}".to_slice
+      @captured_response = RespError.new(message || "unknown error")
     end
 
     def send_ok : Nil
@@ -187,6 +196,23 @@ module Redis
 
     def send_array(arr : Array(RespValue)) : Nil
       @captured_response = arr
+    end
+
+    def send_bytes_array(arr : Array(Bytes)) : Nil
+      result = Array(RespValue).new(arr.size)
+      arr.each { |value| result << value.as(RespValue) }
+      @captured_response = result
+    end
+
+    def send_cursor_bytes_array(cursor : Bytes, items : Array(Bytes)) : Nil
+      result = Array(RespValue).new(2)
+      result << cursor.as(RespValue)
+
+      item_arr = Array(RespValue).new(items.size)
+      items.each { |value| item_arr << value.as(RespValue) }
+      result << item_arr.as(RespValue)
+
+      @captured_response = result
     end
   end
 

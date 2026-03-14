@@ -295,6 +295,17 @@ Spectator.describe "Sorted Set Commands" do
       handler.execute(cmd("ZREVRANGE", "myzset", "0", "1"), conn)
       result = conn.last_response.as(Array)
       expect(result.size).to eq(2)
+      expect(result).to eq([b("c"), b("b")])
+    end
+  end
+
+  describe "ZCOUNT with infinite bounds" do
+    it "counts negative scores with -inf" do
+      handler.execute(cmd("ZADD", "negative_scores", "-2", "a", "-1", "b", "1", "c"), conn)
+      conn.clear
+
+      handler.execute(cmd("ZCOUNT", "negative_scores", "-inf", "+inf"), conn)
+      expect(conn.last_response).to eq(3_i64)
     end
   end
 
@@ -421,6 +432,29 @@ Spectator.describe "Sorted Set Commands" do
       handler.execute(cmd("ZPOPMAX", "myzset"), conn)
       result = conn.last_response
       expect(result).to be_a(Array(Redis::RespValue))
+    end
+  end
+
+  describe "ZRANDMEMBER" do
+    before_each do
+      handler.execute(cmd("ZADD", "myzset", "1", "a", "2", "b", "3", "c"), conn)
+      conn.clear
+    end
+
+    it "returns a bulk string when no count is provided" do
+      handler.execute(cmd("ZRANDMEMBER", "myzset"), conn)
+      expect(conn.last_response).to be_a(Bytes)
+    end
+
+    it "returns an array when count and WITHSCORES are provided" do
+      handler.execute(cmd("ZRANDMEMBER", "myzset", "2", "WITHSCORES"), conn)
+      result = conn.last_response.as(Array)
+      expect(result.size).to eq(4)
+    end
+
+    it "returns an error when WITHSCORES is provided without count" do
+      handler.execute(cmd("ZRANDMEMBER", "myzset", "WITHSCORES"), conn)
+      expect(conn.last_error).to contain("integer")
     end
   end
 

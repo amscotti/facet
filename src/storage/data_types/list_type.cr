@@ -60,7 +60,7 @@ module Redis
 
       end_norm = len - 1 if end_norm >= len
 
-      result = [] of Bytes
+      result = Array(Bytes).new((end_norm - start_norm + 1).to_i)
       (start_norm.to_i..end_norm.to_i).each do |idx|
         result << @data[idx]
       end
@@ -92,7 +92,7 @@ module Redis
             matches += 1
             if matches >= rank
               result << idx.to_i64
-              break if result.size.to_i64 >= count
+              break if count > 0 && result.size.to_i64 >= count
             end
           end
         end
@@ -104,7 +104,7 @@ module Redis
             matches += 1
             if matches >= rank.abs
               result << idx.to_i64
-              break if result.size.to_i64 >= count
+              break if count > 0 && result.size.to_i64 >= count
             end
           end
         end
