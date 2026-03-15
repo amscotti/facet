@@ -73,6 +73,11 @@ Spectator.describe "List Commands" do
       handler.execute(cmd("LPOP", "nonexistent"), conn)
       expect(conn.last_response).to be_nil
     end
+
+    it "returns an error for a non-positive count" do
+      handler.execute(cmd("LPOP", "mylist", "-1"), conn)
+      expect(conn.last_error).to contain("must be positive")
+    end
   end
 
   describe "RPOP" do
@@ -232,6 +237,33 @@ Spectator.describe "List Commands" do
     it "returns nil for empty source" do
       handler.execute(cmd("LMOVE", "empty", "dst", "LEFT", "RIGHT"), conn)
       expect(conn.last_response).to be_nil
+    end
+  end
+
+  describe "LPOS" do
+    before_each do
+      handler.execute(cmd("RPUSH", "mylist", "a", "b", "a", "c", "a"), conn)
+      conn.clear
+    end
+
+    it "returns all matches when COUNT 0 is provided" do
+      handler.execute(cmd("LPOS", "mylist", "a", "COUNT", "0"), conn)
+      expect(conn.last_response).to eq([0_i64, 2_i64, 4_i64] of Redis::RespValue)
+    end
+
+    it "returns an error for COUNT below zero" do
+      handler.execute(cmd("LPOS", "mylist", "a", "COUNT", "-1"), conn)
+      expect(conn.last_error).to contain("COUNT can't be negative")
+    end
+
+    it "returns an error for RANK 0" do
+      handler.execute(cmd("LPOS", "mylist", "a", "RANK", "0"), conn)
+      expect(conn.last_error).to contain("RANK can't be zero")
+    end
+
+    it "returns an error for unknown options" do
+      handler.execute(cmd("LPOS", "mylist", "a", "BOGUS", "1"), conn)
+      expect(conn.last_error).to contain("syntax error")
     end
   end
 end

@@ -74,6 +74,11 @@ Spectator.describe Redis::RespParser do
         expect(result).to be_a(Bytes)
         expect(result.as(Bytes).size).to eq(6)
       end
+
+      it "rejects malformed bulk string terminators" do
+        parser = Redis::RespParser.new(resp_io("$5\r\nhello\n\n"))
+        expect { parser.parse }.to raise_error(Redis::ParseError, /CRLF/)
+      end
     end
 
     context "arrays" do

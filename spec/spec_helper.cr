@@ -83,6 +83,23 @@ class TestConnection < Redis::Connection
     @responses << arr
   end
 
+  def send_bytes_array(arr : Array(Bytes)) : Nil
+    result = Array(Redis::RespValue).new(arr.size)
+    arr.each { |value| result << value.as(Redis::RespValue) }
+    @responses << result
+  end
+
+  def send_cursor_bytes_array(cursor : Bytes, items : Array(Bytes)) : Nil
+    result = Array(Redis::RespValue).new(2)
+    result << cursor.as(Redis::RespValue)
+
+    item_arr = Array(Redis::RespValue).new(items.size)
+    items.each { |value| item_arr << value.as(Redis::RespValue) }
+    result << item_arr.as(Redis::RespValue)
+
+    @responses << result
+  end
+
   def last_response : Redis::RespValue
     @responses.last
   end

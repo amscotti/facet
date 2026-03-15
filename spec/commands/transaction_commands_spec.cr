@@ -246,6 +246,23 @@ Spectator.describe "Transaction Commands" do
       expect(conn.last_response).to be_nil
     end
 
+    it "aborts transaction when a watched list key is modified" do
+      handler.execute(cmd("LPUSH", "mylist", "a"), conn)
+      conn.clear
+
+      handler.execute(cmd("WATCH", "mylist"), conn)
+
+      other_conn = TestConnection.new
+      handler.execute(cmd("LPUSH", "mylist", "b"), other_conn)
+
+      handler.execute(cmd("MULTI"), conn)
+      handler.execute(cmd("LLEN", "mylist"), conn)
+      conn.clear
+      handler.execute(cmd("EXEC"), conn)
+
+      expect(conn.last_response).to be_nil
+    end
+
     it "clears watched keys after EXEC" do
       db.set(b("key"), b("value"))
 

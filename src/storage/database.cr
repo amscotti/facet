@@ -7,25 +7,97 @@ module Redis
 
   alias DataValue = Bytes | ListType | HashType | SetType | SortedSetType
 
-  # LRU cache for compiled regex patterns to avoid re-compilation
-  # Improves performance of SCAN/HSCAN/SSCAN/ZSCAN operations
-  module RegexCache
+  # LRU cache for compiled glob patterns used by Redis-style MATCH filters.
+  module GlobMatcher
     CACHE_SIZE = 128
-    @@cache = Hash(String, Regex).new(initial_capacity: CACHE_SIZE)
+    @@cache = Hash(String, Pattern).new(initial_capacity: CACHE_SIZE)
     @@access_order = [] of String
     @@mutex = Mutex.new
 
-    def self.get(pattern : String) : Regex
+    enum MatchMode
+      Any
+      Exact
+      Prefix
+      Suffix
+      Generic
+    end
+
+    struct Pattern
+      getter source : String
+      getter mode : MatchMode
+
+      def initialize(@source : String)
+        bytes = @source.to_slice
+
+        if bytes == "*".to_slice
+          @mode = MatchMode::Any
+        elsif exact_pattern?(bytes)
+          @mode = MatchMode::Exact
+        elsif prefix_pattern?(bytes)
+          @mode = MatchMode::Prefix
+        elsif suffix_pattern?(bytes)
+          @mode = MatchMode::Suffix
+        else
+          @mode = MatchMode::Generic
+        end
+      end
+
+      def matches?(value : Bytes) : Bool
+        case @mode
+        when MatchMode::Any
+          true
+        when MatchMode::Exact
+          value == @source.to_slice
+        when MatchMode::Prefix
+          prefix = @source.to_slice[0, @source.bytesize - 1]
+          GlobMatcher.starts_with?(value, prefix)
+        when MatchMode::Suffix
+          suffix = @source.to_slice[1, @source.bytesize - 1]
+          GlobMatcher.ends_with?(value, suffix)
+        else
+          GlobMatcher.match(@source.to_slice, 0, value, 0)
+        end
+      end
+
+      private def exact_pattern?(bytes : Bytes) : Bool
+        !bytes.any? { |byte| GlobMatcher.meta_character?(byte) }
+      end
+
+      private def prefix_pattern?(bytes : Bytes) : Bool
+        return false unless bytes.size > 1 && bytes[-1] == '*'.ord.to_u8
+
+        idx = 0
+        while idx < bytes.size - 1
+          return false if GlobMatcher.meta_character?(bytes[idx])
+          idx += 1
+        end
+
+        true
+      end
+
+      private def suffix_pattern?(bytes : Bytes) : Bool
+        return false unless bytes.size > 1 && bytes[0] == '*'.ord.to_u8
+
+        idx = 1
+        while idx < bytes.size
+          return false if GlobMatcher.meta_character?(bytes[idx])
+          idx += 1
+        end
+
+        true
+      end
+    end
+
+    def self.compile(pattern : String) : Pattern
       @@mutex.synchronize do
-        if regex = @@cache[pattern]?
+        if compiled = @@cache[pattern]?
           # Update access order (move to end)
           @@access_order.delete(pattern)
           @@access_order << pattern
-          return regex
+          return compiled
         end
 
-        # Cache miss - compile new regex
-        regex = compile_pattern(pattern)
+        compiled = Pattern.new(pattern)
 
         # Evict oldest if at capacity
         if @@cache.size >= CACHE_SIZE
@@ -34,16 +106,129 @@ module Redis
         end
 
         # Add to cache
-        @@cache[pattern] = regex
+        @@cache[pattern] = compiled
         @@access_order << pattern
-        regex
+        compiled
       end
     end
 
-    private def self.compile_pattern(pattern : String) : Regex
-      escaped = Regex.escape(pattern)
-      regex_str = escaped.gsub("\\*", ".*").gsub("\\?", ".")
-      Regex.new("^#{regex_str}$")
+    def self.meta_character?(byte : UInt8) : Bool
+      byte == '*'.ord.to_u8 || byte == '?'.ord.to_u8 || byte == '['.ord.to_u8 || byte == '\\'.ord.to_u8
+    end
+
+    def self.starts_with?(value : Bytes, prefix : Bytes) : Bool
+      return false if prefix.size > value.size
+
+      idx = 0
+      while idx < prefix.size
+        return false if value[idx] != prefix[idx]
+        idx += 1
+      end
+
+      true
+    end
+
+    def self.ends_with?(value : Bytes, suffix : Bytes) : Bool
+      return false if suffix.size > value.size
+
+      offset = value.size - suffix.size
+      idx = 0
+      while idx < suffix.size
+        return false if value[offset + idx] != suffix[idx]
+        idx += 1
+      end
+
+      true
+    end
+
+    def self.match(pattern : Bytes, pattern_idx : Int32, value : Bytes, value_idx : Int32) : Bool
+      while pattern_idx < pattern.size && value_idx < value.size
+        case pattern[pattern_idx]
+        when '*'.ord.to_u8
+          while pattern_idx + 1 < pattern.size && pattern[pattern_idx + 1] == '*'.ord.to_u8
+            pattern_idx += 1
+          end
+
+          return true if pattern_idx == pattern.size - 1
+
+          next_pattern_idx = pattern_idx + 1
+          backtrack_idx = value_idx
+          while backtrack_idx < value.size
+            return true if match(pattern, next_pattern_idx, value, backtrack_idx)
+            backtrack_idx += 1
+          end
+
+          return false
+        when '?'.ord.to_u8
+          pattern_idx += 1
+          value_idx += 1
+        when '['.ord.to_u8
+          matched, next_pattern_idx = match_character_class(pattern, pattern_idx, value[value_idx])
+          return false unless matched
+
+          pattern_idx = next_pattern_idx + 1
+          value_idx += 1
+        when '\\'.ord.to_u8
+          pattern_idx += 1 if pattern_idx + 1 < pattern.size
+          return false if pattern[pattern_idx] != value[value_idx]
+
+          pattern_idx += 1
+          value_idx += 1
+        else
+          return false if pattern[pattern_idx] != value[value_idx]
+
+          pattern_idx += 1
+          value_idx += 1
+        end
+      end
+
+      while pattern_idx < pattern.size && pattern[pattern_idx] == '*'.ord.to_u8
+        pattern_idx += 1
+      end
+
+      pattern_idx == pattern.size && value_idx == value.size
+    end
+
+    private def self.match_character_class(pattern : Bytes, open_bracket_idx : Int32, byte : UInt8) : {Bool, Int32}
+      idx = open_bracket_idx + 1
+      negated = false
+      matched = false
+      closed = false
+
+      if idx < pattern.size && pattern[idx] == '^'.ord.to_u8
+        negated = true
+        idx += 1
+      end
+
+      while idx < pattern.size
+        current = pattern[idx]
+
+        if current == ']'.ord.to_u8
+          closed = true
+          break
+        elsif current == '\\'.ord.to_u8 && idx + 1 < pattern.size
+          idx += 1
+          matched ||= pattern[idx] == byte
+        elsif idx + 2 < pattern.size && pattern[idx + 1] == '-'.ord.to_u8
+          range_start = current
+          range_end = pattern[idx + 2]
+          if range_start > range_end
+            range_start, range_end = range_end, range_start
+          end
+          matched ||= byte >= range_start && byte <= range_end
+          idx += 2
+        else
+          matched ||= current == byte
+        end
+
+        idx += 1
+      end
+
+      unless closed
+        return {pattern[open_bracket_idx] == byte, open_bracket_idx}
+      end
+
+      {negated ? !matched : matched, idx}
     end
   end
 
@@ -52,7 +237,7 @@ module Redis
     # Parse Int64 from Bytes without intermediate allocations
     def self.bytes_to_i64(bytes : Bytes?) : Int64
       return 0_i64 unless bytes
-      String.new(bytes).to_i64
+      parse_i64(bytes)
     end
 
     # Parse Float64 from Bytes without intermediate allocations
@@ -69,6 +254,46 @@ module Redis
     # Convert Float64 to Bytes
     def self.f64_to_bytes(num : Float64) : Bytes
       num.to_s.to_slice
+    end
+
+    private def self.parse_i64(bytes : Bytes) : Int64
+      raise ArgumentError.new("Invalid Int64") if bytes.empty?
+
+      idx = 0
+      negative = false
+
+      case bytes[0]
+      when '+'.ord.to_u8
+        idx = 1
+      when '-'.ord.to_u8
+        negative = true
+        idx = 1
+      end
+
+      raise ArgumentError.new("Invalid Int64") if idx >= bytes.size
+
+      value = 0_i64
+      limit = negative ? Int64::MIN : -Int64::MAX
+      multmin = limit // 10
+
+      while idx < bytes.size
+        byte = bytes[idx]
+        unless byte >= '0'.ord.to_u8 && byte <= '9'.ord.to_u8
+          raise ArgumentError.new("Invalid Int64")
+        end
+
+        digit = (byte - '0'.ord.to_u8).to_i64
+
+        raise ArgumentError.new("Invalid Int64") if value < multmin
+
+        value *= 10
+        raise ArgumentError.new("Invalid Int64") if value < limit + digit
+
+        value -= digit
+        idx += 1
+      end
+
+      negative ? value : -value
     end
   end
 
@@ -114,7 +339,7 @@ module Redis
     end
 
     def hgetall : Array(Bytes)
-      result = [] of Bytes
+      result = Array(Bytes).new(@data.size * 2)
       @data.each do |key, val|
         result << key
         result << val
@@ -155,34 +380,47 @@ module Redis
 
     # Cursor-based field iteration
     def hscan(cursor : Int64, pattern : String? = nil, count : Int64 = 10) : {Int64, Array(Bytes)}
-      all_fields = @data.keys
-      start_idx = cursor.to_i
+      return {0_i64, [] of Bytes} if cursor < 0
 
-      return {0_i64, [] of Bytes} if start_idx >= all_fields.size
-
-      results = [] of Bytes
-      idx = start_idx
-      regex = pattern ? pattern_to_regex(pattern) : nil
-
-      scanned = 0
+      results = Array(Bytes).new(count.to_i * 2)
+      matcher = pattern_matcher(pattern)
+      scanned = 0_i64
+      visible_index = 0_i64
       max_scan = count * 2
-      while idx < all_fields.size && results.size < count * 2 # Return field + value pairs
-        field = all_fields[idx]
-        if regex.nil? || regex.matches?(String.new(field))
-          results << field
-          results << @data[field]
+      next_cursor = 0_i64
+      should_stop = false
+
+      @data.each do |field, value|
+        if visible_index < cursor
+          visible_index += 1
+          next
         end
-        idx += 1
+
+        if should_stop
+          next_cursor = visible_index
+          break
+        end
+
+        if matcher.nil? || matcher.matches?(field)
+          results << field
+          results << value
+        end
+
+        visible_index += 1
         scanned += 1
-        break if scanned >= max_scan
+
+        if scanned >= max_scan || results.size >= count * 2
+          should_stop = true
+        end
       end
 
-      next_cursor = idx >= all_fields.size ? 0_i64 : idx.to_i64
       {next_cursor, results}
     end
 
-    private def pattern_to_regex(pattern : String) : Regex
-      RegexCache.get(pattern)
+    private def pattern_matcher(pattern : String?) : GlobMatcher::Pattern?
+      return nil unless pattern && pattern != "*"
+
+      GlobMatcher.compile(pattern)
     end
   end
 
@@ -284,33 +522,46 @@ module Redis
 
     # Cursor-based member iteration
     def sscan(cursor : Int64, pattern : String? = nil, count : Int64 = 10) : {Int64, Array(Bytes)}
-      all_members = @data.to_a
-      start_idx = cursor.to_i
+      return {0_i64, [] of Bytes} if cursor < 0
 
-      return {0_i64, [] of Bytes} if start_idx >= all_members.size
-
-      results = [] of Bytes
-      idx = start_idx
-      regex = pattern ? pattern_to_regex(pattern) : nil
-
-      scanned = 0
+      results = Array(Bytes).new(count.to_i)
+      matcher = pattern_matcher(pattern)
+      scanned = 0_i64
+      visible_index = 0_i64
       max_scan = count * 2
-      while idx < all_members.size && results.size < count
-        member = all_members[idx]
-        if regex.nil? || regex.matches?(String.new(member))
+      next_cursor = 0_i64
+      should_stop = false
+
+      @data.each do |member|
+        if visible_index < cursor
+          visible_index += 1
+          next
+        end
+
+        if should_stop
+          next_cursor = visible_index
+          break
+        end
+
+        if matcher.nil? || matcher.matches?(member)
           results << member
         end
-        idx += 1
+
+        visible_index += 1
         scanned += 1
-        break if scanned >= max_scan
+
+        if scanned >= max_scan || results.size >= count
+          should_stop = true
+        end
       end
 
-      next_cursor = idx >= all_members.size ? 0_i64 : idx.to_i64
       {next_cursor, results}
     end
 
-    private def pattern_to_regex(pattern : String) : Regex
-      RegexCache.get(pattern)
+    private def pattern_matcher(pattern : String?) : GlobMatcher::Pattern?
+      return nil unless pattern && pattern != "*"
+
+      GlobMatcher.compile(pattern)
     end
   end
 
@@ -432,18 +683,18 @@ module Redis
       end_norm = len - 1 if end_norm >= len
 
       result = [] of (Bytes | Float64)
-      range = start_norm.to_i..end_norm.to_i
+      range = start_norm..end_norm
 
       if reverse
-        range.reverse_each do |idx|
-          actual_idx = @members_by_score.size - 1 - idx
-          entry = @members_by_score[actual_idx]
+        range.each do |idx|
+          actual_idx = len - 1 - idx
+          entry = @members_by_score[actual_idx.to_i]
           result << entry[1]
           result << entry[0] if withscores
         end
       else
         range.each do |idx|
-          entry = @members_by_score[idx]
+          entry = @members_by_score[idx.to_i]
           result << entry[1]
           result << entry[0] if withscores
         end
@@ -547,34 +798,47 @@ module Redis
 
     # Cursor-based member iteration with scores
     def zscan(cursor : Int64, pattern : String? = nil, count : Int64 = 10) : {Int64, Array(Bytes | Float64)}
-      all_members = @scores.keys
-      start_idx = cursor.to_i
+      return {0_i64, [] of (Bytes | Float64)} if cursor < 0
 
-      return {0_i64, [] of (Bytes | Float64)} if start_idx >= all_members.size
-
-      results = [] of (Bytes | Float64)
-      idx = start_idx
-      regex = pattern ? pattern_to_regex(pattern) : nil
-
-      scanned = 0
+      results = Array(Bytes | Float64).new(count.to_i * 2)
+      matcher = pattern_matcher(pattern)
+      scanned = 0_i64
+      visible_index = 0_i64
       max_scan = count * 2
-      while idx < all_members.size && results.size < count * 2 # Return member + score pairs
-        member = all_members[idx]
-        if regex.nil? || regex.matches?(String.new(member))
-          results << member
-          results << @scores[member]
+      next_cursor = 0_i64
+      should_stop = false
+
+      @scores.each do |member, score|
+        if visible_index < cursor
+          visible_index += 1
+          next
         end
-        idx += 1
+
+        if should_stop
+          next_cursor = visible_index
+          break
+        end
+
+        if matcher.nil? || matcher.matches?(member)
+          results << member
+          results << score
+        end
+
+        visible_index += 1
         scanned += 1
-        break if scanned >= max_scan
+
+        if scanned >= max_scan || results.size >= count * 2
+          should_stop = true
+        end
       end
 
-      next_cursor = idx >= all_members.size ? 0_i64 : idx.to_i64
       {next_cursor, results}
     end
 
-    private def pattern_to_regex(pattern : String) : Regex
-      RegexCache.get(pattern)
+    private def pattern_matcher(pattern : String?) : GlobMatcher::Pattern?
+      return nil unless pattern && pattern != "*"
+
+      GlobMatcher.compile(pattern)
     end
 
     private def insert_sorted(member : Bytes, score : Float64) : Nil
@@ -609,29 +873,16 @@ module Redis
       end
 
       end_norm = len - 1 if end_norm >= len
-
-      range = if reverse
-                (len - 1 - end_norm.to_i)..(len - 1 - start_norm.to_i)
-              else
-                start_norm.to_i..end_norm.to_i
-              end
-
-      result = [] of {Float64, Bytes}
-
-      range.reverse_each do |idx|
-        actual_idx = if reverse
-                       idx
-                     else
-                       end_norm.to_i - (idx - start_norm.to_i)
-                     end
-
-        entry = source.@members_by_score[actual_idx]
+      count = 0_i64
+      (start_norm..end_norm).each do |idx|
+        actual_idx = reverse ? (len - 1 - idx) : idx
+        entry = source.@members_by_score[actual_idx.to_i]
         @scores[entry[1]] = entry[0]
-        @members_by_score.push({entry[0], entry[1]})
-        result << {entry[0], entry[1]}
+        insert_sorted(entry[1], entry[0])
+        count += 1
       end
 
-      result.size.to_i64
+      count
     end
   end
 
@@ -665,17 +916,24 @@ module Redis
 
   class Database
     @data : Hash(Bytes, Entry)
+    @key_index : Array(Bytes)
+    @key_positions : Hash(Bytes, Int32)
     @key_versions : Hash(Bytes, Int64)
     @global_version : Int64
+    @may_have_expiring_keys : Bool
 
     def initialize
       @data = Hash(Bytes, Entry).new(initial_capacity: 1000)
+      @key_index = [] of Bytes
+      @key_positions = Hash(Bytes, Int32).new(initial_capacity: 1000)
       @key_versions = Hash(Bytes, Int64).new
       @global_version = 0_i64
+      @may_have_expiring_keys = false
     end
 
     # Get the current version of a key (for WATCH)
     def get_key_version(key : Bytes) : Int64
+      purge_expired_key(key)
       @key_versions[key]? || 0_i64
     end
 
@@ -710,13 +968,18 @@ module Redis
     def set(key : Bytes, value : Bytes, ttl : Int64? = nil) : Nil
       validate_key_size(key)
       validate_value_size(value)
+      register_key(key)
       @data[key] = Entry.new(value, ttl)
+      @may_have_expiring_keys = true if ttl
       touch_key(key)
     end
 
     def del(key : Bytes) : Bool
       result = @data.delete(key) != nil
-      untouch_key(key) if result
+      if result
+        unregister_key(key)
+        untouch_key(key)
+      end
       result
     end
 
@@ -739,18 +1002,55 @@ module Redis
     end
 
     def size : Int32
-      @data.size
+      purge_expired_entries
+      @key_index.size
     end
 
     def clear : Nil
       # Bump versions for all existing keys before clearing
       @data.keys.each { |key| untouch_key(key) }
       @data.clear
+      @key_index.clear
+      @key_positions.clear
       @key_versions.clear
+      @may_have_expiring_keys = false
     end
 
     def keys : Array(Bytes)
-      @data.keys
+      purge_expired_entries
+      @key_index.dup
+    end
+
+    def keys_matching(pattern : String) : Array(Bytes)
+      results = Array(Bytes).new(@key_index.size)
+      matcher = pattern_matcher(pattern)
+
+      if @may_have_expiring_keys
+        expired_keys = [] of Bytes
+        now = Time.utc.to_unix_ms
+
+        @key_index.each do |key|
+          entry = @data[key]?
+          next unless entry
+
+          if expired?(entry, now)
+            expired_keys << key
+            next
+          end
+
+          results << key if matcher.nil? || matcher.matches?(key)
+        end
+
+        delete_expired_keys(expired_keys)
+      else
+        @key_index.each do |key|
+          entry = @data[key]?
+          next unless entry
+          results << key if matcher.nil? || matcher.matches?(key)
+        end
+      end
+
+      results
     end
 
     def append(key : Bytes, value : Bytes) : Int64
@@ -804,6 +1104,7 @@ module Redis
     end
 
     def decrby(key : Bytes, decrement : Int64) : Int64
+      raise OverflowError.new if decrement == Int64::MIN
       incrby(key, -decrement)
     end
 
@@ -849,7 +1150,9 @@ module Redis
         return list
       end
       list = ListType.new
+      register_key(key)
       @data[key] = Entry.new(list)
+      touch_key(key)
       list
     end
 
@@ -867,7 +1170,9 @@ module Redis
         return hash
       end
       hash = HashType.new
+      register_key(key)
       @data[key] = Entry.new(hash)
+      touch_key(key)
       hash
     end
 
@@ -885,7 +1190,9 @@ module Redis
         return set_val
       end
       set_val = SetType.new
+      register_key(key)
       @data[key] = Entry.new(set_val)
+      touch_key(key)
       set_val
     end
 
@@ -903,7 +1210,9 @@ module Redis
         return zset
       end
       zset = SortedSetType.new
+      register_key(key)
       @data[key] = Entry.new(zset)
+      touch_key(key)
       zset
     end
 
@@ -925,7 +1234,10 @@ module Redis
                       else                    false
                       end
 
-      @data.delete(key) if should_delete
+      if should_delete && @data.delete(key)
+        unregister_key(key)
+        untouch_key(key)
+      end
     end
 
     # TTL Management Methods
@@ -934,7 +1246,17 @@ module Redis
     def expire(key : Bytes, ttl_ms : Int64) : Bool
       entry = get_valid_entry(key)
       return false unless entry
+
+      if ttl_ms <= Time.utc.to_unix_ms
+        @data.delete(key)
+        unregister_key(key)
+        untouch_key(key)
+        return true
+      end
+
       @data[key] = Entry.new(entry.data, ttl_ms)
+      @may_have_expiring_keys = true
+      touch_key(key)
       true
     end
 
@@ -944,6 +1266,7 @@ module Redis
       return false unless entry
       return false unless entry.ttl # No TTL to remove
       @data[key] = Entry.new(entry.data, nil)
+      touch_key(key)
       true
     end
 
@@ -955,6 +1278,7 @@ module Redis
       if ttl = entry.ttl
         if Time.utc.to_unix_ms > ttl
           @data.delete(key)
+          untouch_key(key)
           return -2_i64
         end
         return ttl - Time.utc.to_unix_ms
@@ -978,6 +1302,7 @@ module Redis
 
       @data[new_key] = entry
       @data.delete(old_key)
+      rebuild_key_index
       touch_key(new_key)
       untouch_key(old_key)
       {true, nil}
@@ -994,6 +1319,7 @@ module Redis
 
       @data[new_key] = entry
       @data.delete(old_key)
+      rebuild_key_index
       touch_key(new_key)
       untouch_key(old_key)
       {1_i64, nil}
@@ -1003,37 +1329,55 @@ module Redis
 
     # Cursor-based key iteration
     def scan(cursor : Int64, pattern : String? = nil, count : Int64 = 10) : {Int64, Array(Bytes)}
-      all_keys = keys
-      start_idx = cursor.to_i
+      return {0_i64, [] of Bytes} if cursor < 0
 
-      return {0_i64, [] of Bytes} if start_idx >= all_keys.size
-
-      results = [] of Bytes
-      idx = start_idx
-      regex = pattern ? pattern_to_regex(pattern) : nil
-
-      # Scan up to count keys (or 2x count if filtering)
-      scanned = 0
+      results = Array(Bytes).new(count.to_i)
+      matcher = pattern_matcher(pattern)
+      scanned = 0_i64
+      idx = cursor.to_i
       max_scan = count * 2
-      while idx < all_keys.size && results.size < count
-        key = all_keys[idx]
-        # Check expiration
-        if get_valid_entry(key)
-          if regex.nil? || regex.matches?(String.new(key))
-            results << key
+      return {0_i64, results} if idx >= @key_index.size
+
+      if @may_have_expiring_keys
+        expired_keys = [] of Bytes
+        now = Time.utc.to_unix_ms
+
+        while idx < @key_index.size && scanned < max_scan && results.size < count
+          key = @key_index[idx]
+          entry = @data[key]?
+          idx += 1
+          next unless entry
+
+          if expired?(entry, now)
+            expired_keys << key
+            next
           end
+
+          results << key if matcher.nil? || matcher.matches?(key)
+          scanned += 1
         end
-        idx += 1
-        scanned += 1
-        break if scanned >= max_scan
+
+        delete_expired_keys(expired_keys)
+      else
+        while idx < @key_index.size && scanned < max_scan && results.size < count
+          key = @key_index[idx]
+          entry = @data[key]?
+          idx += 1
+          next unless entry
+
+          results << key if matcher.nil? || matcher.matches?(key)
+          scanned += 1
+        end
       end
 
-      next_cursor = idx >= all_keys.size ? 0_i64 : idx.to_i64
+      next_cursor = idx >= @key_index.size ? 0_i64 : idx.to_i64
       {next_cursor, results}
     end
 
-    private def pattern_to_regex(pattern : String) : Regex
-      RegexCache.get(pattern)
+    private def pattern_matcher(pattern : String?) : GlobMatcher::Pattern?
+      return nil unless pattern && pattern != "*"
+
+      GlobMatcher.compile(pattern)
     end
 
     private def get_valid_entry(key : Bytes) : Entry?
@@ -1043,10 +1387,88 @@ module Redis
       if ttl = entry.ttl
         if Time.utc.to_unix_ms > ttl
           @data.delete(key)
+          unregister_key(key)
+          untouch_key(key)
           return nil
         end
       end
       entry
+    end
+
+    private def purge_expired_entries : Nil
+      return unless @may_have_expiring_keys
+
+      now = Time.utc.to_unix_ms
+      expired_keys = [] of Bytes
+
+      @data.each do |key, entry|
+        ttl = entry.ttl
+        next unless ttl && now > ttl
+
+        expired_keys << key
+      end
+
+      delete_expired_keys(expired_keys)
+    end
+
+    private def purge_expired_key(key : Bytes) : Nil
+      return unless @may_have_expiring_keys
+
+      entry = @data[key]?
+      return unless entry
+
+      ttl = entry.ttl
+      return unless ttl && Time.utc.to_unix_ms > ttl
+
+      if @data.delete(key)
+        unregister_key(key)
+        untouch_key(key)
+      end
+    end
+
+    private def delete_expired_keys(expired_keys : Array(Bytes)) : Nil
+      expired_keys.each do |key|
+        if @data.delete(key)
+          unregister_key(key)
+          untouch_key(key)
+        end
+      end
+    end
+
+    private def register_key(key : Bytes) : Nil
+      return if @key_positions.has_key?(key)
+
+      @key_positions[key] = @key_index.size
+      @key_index << key
+    end
+
+    private def unregister_key(key : Bytes) : Nil
+      idx = @key_positions.delete(key)
+      return unless idx
+
+      last_idx = @key_index.size - 1
+      if idx < last_idx
+        last_key = @key_index[last_idx]
+        @key_index[idx] = last_key
+        @key_positions[last_key] = idx
+      end
+
+      @key_index.pop
+    end
+
+    private def rebuild_key_index : Nil
+      @key_index.clear
+      @key_positions.clear
+
+      @data.each_key do |key|
+        @key_positions[key] = @key_index.size
+        @key_index << key
+      end
+    end
+
+    private def expired?(entry : Entry, now : Int64) : Bool
+      ttl = entry.ttl
+      !!(ttl && now > ttl)
     end
 
     private def normalize_index(idx : Int64, len : Int64) : Int64

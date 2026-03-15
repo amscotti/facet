@@ -12,6 +12,11 @@ Spectator.describe Redis::RespSerializer do
         result = Redis::RespSerializer.serialize("")
         expect(String.new(result)).to eq("+\r\n")
       end
+
+      it "serializes RESP errors" do
+        result = Redis::RespSerializer.serialize(Redis::RespError.new("boom"))
+        expect(String.new(result)).to eq("-ERR boom\r\n")
+      end
     end
 
     context "integers" do

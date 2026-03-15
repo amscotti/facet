@@ -49,6 +49,23 @@ Spectator.describe "SCAN Commands" do
       expect(keys.size).to eq(2)
     end
 
+    it "supports character classes and escaped specials in MATCH" do
+      db.set(b("hello"), b("1"))
+      db.set(b("hallo"), b("1"))
+      db.set(b("h?llo"), b("1"))
+
+      handler.execute(cmd("SCAN", "0", "MATCH", "h[ae]llo"), conn)
+      result = conn.last_response.as(Array)
+      keys = result[1].as(Array)
+      expect(keys).to contain(b("hello"))
+      expect(keys).to contain(b("hallo"))
+      expect(keys).not_to contain(b("h?llo"))
+
+      handler.execute(cmd("SCAN", "0", "MATCH", "h\\?llo"), conn)
+      escaped = conn.last_response.as(Array)[1].as(Array)
+      expect(escaped).to eq([b("h?llo")] of Redis::RespValue)
+    end
+
     it "respects COUNT hint" do
       10.times do |i|
         db.set(b("key#{i}"), b("value#{i}"))
@@ -75,6 +92,16 @@ Spectator.describe "SCAN Commands" do
         result2 = conn.last_response.as(Array)
         expect(result2).to be_a(Array(Redis::RespValue))
       end
+    end
+
+    it "returns an error for an invalid cursor" do
+      handler.execute(cmd("SCAN", "nope"), conn)
+      expect(conn.last_error).to contain("invalid cursor")
+    end
+
+    it "returns an error for invalid COUNT" do
+      handler.execute(cmd("SCAN", "0", "COUNT", "0"), conn)
+      expect(conn.last_error).to contain("syntax error")
     end
   end
 
@@ -124,6 +151,11 @@ Spectator.describe "SCAN Commands" do
       # Should only have user_name and user_age pairs (4 elements)
       expect(items.size).to eq(4)
     end
+
+    it "returns an error for an invalid cursor" do
+      handler.execute(cmd("HSCAN", "myhash", "nope"), conn)
+      expect(conn.last_error).to contain("invalid cursor")
+    end
   end
 
   describe "SSCAN" do
@@ -169,6 +201,11 @@ Spectator.describe "SCAN Commands" do
       members = result[1].as(Array)
 
       expect(members.size).to eq(2)
+    end
+
+    it "returns an error for an invalid cursor" do
+      handler.execute(cmd("SSCAN", "myset", "nope"), conn)
+      expect(conn.last_error).to contain("invalid cursor")
     end
   end
 
@@ -217,6 +254,11 @@ Spectator.describe "SCAN Commands" do
 
       # Should only have user:1 and user:2 pairs (4 elements)
       expect(items.size).to eq(4)
+    end
+
+    it "returns an error for an invalid cursor" do
+      handler.execute(cmd("ZSCAN", "myzset", "nope"), conn)
+      expect(conn.last_error).to contain("invalid cursor")
     end
   end
 end

@@ -127,6 +127,11 @@ Spectator.describe "Set Commands" do
       expect(result).to be_a(Array(Redis::RespValue))
       expect(result.as(Array).size).to eq(2)
     end
+
+    it "returns an error for a non-positive count" do
+      handler.execute(cmd("SPOP", "myset", "-1"), conn)
+      expect(conn.last_error).to contain("must be positive")
+    end
   end
 
   describe "SRANDMEMBER" do
@@ -148,6 +153,11 @@ Spectator.describe "Set Commands" do
       handler.execute(cmd("SRANDMEMBER", "myset", "2"), conn)
       result = conn.last_response
       expect(result).to be_a(Array(Redis::RespValue))
+    end
+
+    it "returns an error for an invalid count" do
+      handler.execute(cmd("SRANDMEMBER", "myset", "nope"), conn)
+      expect(conn.last_error).to contain("integer")
     end
   end
 
@@ -209,6 +219,18 @@ Spectator.describe "Set Commands" do
 
       handler.execute(cmd("SCARD", "dest"), conn)
       expect(conn.last_response).to eq(3_i64)
+    end
+
+    it "replaces an existing destination set" do
+      handler.execute(cmd("SADD", "dest", "stale"), conn)
+      conn.clear
+
+      handler.execute(cmd("SUNIONSTORE", "dest", "set1", "set2"), conn)
+      expect(conn.last_response).to eq(3_i64)
+
+      handler.execute(cmd("SMEMBERS", "dest"), conn)
+      result = conn.last_response.as(Array)
+      expect(result).not_to contain(b("stale"))
     end
   end
 

@@ -273,7 +273,9 @@ Spectator.describe Redis::CapturingConnection do
 
       it "captures send_error" do
         cap_conn.send_error("Error message")
-        expect(cap_conn.captured_response).to eq(b("-ERR Error message"))
+        response = cap_conn.captured_response
+        expect(response).to be_a(Redis::RespError)
+        expect(response.as(Redis::RespError).message).to eq("Error message")
       end
 
       it "captures send_ok" do

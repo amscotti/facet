@@ -263,11 +263,10 @@ module Redis
 
     private def copy_matching_keys(source : Database, dest : Database, pattern : String) : Int64
       count = 0_i64
-      regex = pattern_to_regex(pattern)
+      matcher = GlobMatcher.compile(pattern)
 
       source.keys.each do |key|
-        key_str = String.new(key)
-        next unless regex.matches?(key_str)
+        next unless matcher.matches?(key)
 
         entry = source.get_entry(key)
         next unless entry
@@ -330,11 +329,7 @@ module Redis
     end
 
     private def matches_pattern?(str : String, pattern : String) : Bool
-      pattern_to_regex(pattern).matches?(str)
-    end
-
-    private def pattern_to_regex(pattern : String) : Regex
-      RegexCache.get(pattern)
+      GlobMatcher.compile(pattern).matches?(str.to_slice)
     end
   end
 end
